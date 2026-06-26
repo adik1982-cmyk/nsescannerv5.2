@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10,7 +11,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
   <link rel="manifest" href="./manifest.json"/>
   <link rel="apple-touch-icon" href="./icons/icon-192.png"/>
-  <title>NSE Intraday Screener v5</title>
+  <title>NSE Intraday Screener v5.1</title>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
     :root{
@@ -223,7 +224,7 @@
         <div class="brand-dot" id="brandDot"></div>
         <div>
           <div class="brand-name">NSE SCREENER PRO</div>
-          <div class="brand-sub">INTRADAY · OPTIONS · v5</div>
+          <div class="brand-sub">INTRADAY · OPTIONS · v5.1</div>
         </div>
       </div>
       <div class="hdr-right">
@@ -488,6 +489,14 @@ const NSE_HOLIDAYS = {
   '2025-11-05':'Prakash Gurpurb/Gurunanak Jayanti',
   '2025-12-25':'Christmas',
   '2026-01-26':'Republic Day',
+  '2026-02-26':'Mahashivratri',
+  '2026-03-20':'Holi',
+  '2026-03-30':'Id-Ul-Fitr (Ramzan Id)',
+  '2026-04-03':'Good Friday',
+  '2026-04-14':'Dr. Ambedkar Jayanti',
+  '2026-05-01':'Maharashtra Day',
+  '2026-06-17':'Eid ul-Adha',
+  '2026-06-26':'Muharram',
   '2026-03-03':'Mahashivratri',
   '2026-03-20':'Holi',
   '2026-03-30':'Id-Ul-Fitr (Ramzan Id)',
@@ -619,8 +628,15 @@ async function fetchQuotes(tokens){
         open:parseFloat(q.open||0),high:parseFloat(q.high||0),low:parseFloat(q.low||0),
         vol:parseInt(q.tradeVolume||q.tradedVolume||0),
         oi:parseInt(q.opnInterest||0),
-        // FIX 3: Use opnInterestChange directly as percentage value
-        oiChgPct:parseFloat(q.opnInterestChange||0),
+        // OI Change % — try multiple Angel One field names
+        oiChgPct:(()=>{
+          const raw=parseFloat(q.opnInterestChange||q.oiChange||q.changeInOI||0);
+          if(raw!==0) return raw;
+          const oi=parseInt(q.opnInterest||0);
+          const oiPrev=parseInt(q.opnInterestPrev||q.prevOpnInterest||0);
+          if(oi>0&&oiPrev>0) return((oi-oiPrev)/oiPrev)*100;
+          return 0;
+        })(),
         pct:parseFloat(q.percentChange||0),
       };
     });
@@ -708,8 +724,7 @@ async function runScan(auto=false){
 
       const row={sym:s.sym,sector:s.sector,ltp:q.ltp,chg:q.pct,vol:q.vol,volAvg:va,
         rsi:rv,macd:rm,ema9:e9,ema21:e21,oi:q.oi,
-        // FIX 3: oiChgPct comes directly from Angel One as percentage
-        oiChgPct:q.oiChgPct,
+        oiChgPct:q.oiChgPct||0,
         bScore:0,beScore:0};
       row.bScore=bullScore(row);row.beScore=bearScore(row);
       allRows.push(row);
@@ -758,7 +773,7 @@ function renderList(){
     const cc=r.chg>=0?'cg':'cr';
     const rc=r.rsi>=60?'cg':r.rsi>=50?'ca':'cr';
     const mc=r.macd>0?'cg':'cr';
-    const oc=r.oiChgPct>=3?'cg':r.oiChgPct>=0?'ca':'cr';
+    const oc=r.oiChgPct>3?'cg':r.oiChgPct>0?'ca':r.oiChgPct<0?'cr':'cm';
     return `<div class="srow ${si.rc}" onclick="openTV('${r.sym}')" ontouchstart="this.classList.add('touched')" ontouchend="this.classList.remove('touched')">
       <div>
         <div class="sym-name">${r.sym}</div>
