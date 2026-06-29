@@ -11,7 +11,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
   <link rel="manifest" href="./manifest.json"/>
   <link rel="apple-touch-icon" href="./icons/icon-192.png"/>
-  <title>NSE Intraday Screener v5.2</title>
+  <title>NSE Intraday Screener v5.3</title>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
     :root{
@@ -224,7 +224,7 @@
         <div class="brand-dot" id="brandDot"></div>
         <div>
           <div class="brand-name">NSE SCREENER PRO</div>
-          <div class="brand-sub">INTRADAY · OPTIONS · v5.2</div>
+          <div class="brand-sub">INTRADAY · OPTIONS · v5.3</div>
         </div>
       </div>
       <div class="hdr-right">
@@ -665,6 +665,66 @@ async function fetchQuotes(tokens){
   }catch{return{};}
 }
 
+// ── OI Data from Angel One OI Buildup API ─────────────────────────────────
+// NSE equity quotes return opnInterest=0 — OI only available via NFO segment
+// Solution: Use Angel One's dedicated OI Buildup API
+let oiCache = {}; // cache OI data to avoid repeated API calls
+
+async function fetchOIData(){
+  try{
+    // Angel One OI Buildup API — returns top OI change stocks in NFO
+    const r = await fetch(`${AB}/rest/secure/angelbroking/marketData/v1/gainersLosers`,{
+      method:'POST',
+      headers:mkHdr(session.apiKey,session.jwt),
+      body:JSON.stringify({
+        datatype:'OIGainers',   // OI buildup leaders
+        expirytype:'NEAR'       // near month expiry
+      })
+    });
+    const d = await r.json();
+    if(d?.status && d?.data){
+      oiCache = {};
+      d.data.forEach(item=>{
+        // tradingSymbol like "RELIANCE25JULFUT" -> extract base symbol
+        const sym = item.tradingSymbol.replace(/\d{2}[A-Z]{3}\d{0,2}FUT$/,'').replace(/\d{2}[A-Z]{3}FUT$/,'');
+        if(sym){
+          oiCache[sym] = {
+            oi: parseFloat(item.opnInterest||0),
+            oiChgPct: parseFloat(item.netChangeOpnInterest||0),
+            // netChangeOpnInterest is absolute change — compute %
+            oiChgAbsolute: parseFloat(item.netChangeOpnInterest||0),
+          };
+          // Calculate % if we have both values
+          if(oiCache[sym].oi > 0 && oiCache[sym].oiChgAbsolute !== 0){
+            const prevOI = oiCache[sym].oi - oiCache[sym].oiChgAbsolute;
+            if(prevOI > 0) oiCache[sym].oiChgPct = (oiCache[sym].oiChgAbsolute / prevOI) * 100;
+          }
+        }
+      });
+      console.log('OI cache built:', Object.keys(oiCache).length, 'stocks');
+    }
+    // Also fetch OI Losers (short buildup)
+    const r2 = await fetch(`${AB}/rest/secure/angelbroking/marketData/v1/gainersLosers`,{
+      method:'POST',
+      headers:mkHdr(session.apiKey,session.jwt),
+      body:JSON.stringify({datatype:'OILosers',expirytype:'NEAR'})
+    });
+    const d2 = await r2.json();
+    if(d2?.status && d2?.data){
+      d2.data.forEach(item=>{
+        const sym = item.tradingSymbol.replace(/\d{2}[A-Z]{3}\d{0,2}FUT$/,'').replace(/\d{2}[A-Z]{3}FUT$/,'');
+        if(sym && !oiCache[sym]){
+          oiCache[sym]={oi:parseFloat(item.opnInterest||0),oiChgAbsolute:parseFloat(item.netChangeOpnInterest||0),oiChgPct:0};
+          if(oiCache[sym].oi>0&&oiCache[sym].oiChgAbsolute!==0){
+            const prev=oiCache[sym].oi-oiCache[sym].oiChgAbsolute;
+            if(prev>0)oiCache[sym].oiChgPct=(oiCache[sym].oiChgAbsolute/prev)*100;
+          }
+        }
+      });
+    }
+  }catch(e){console.log('OI fetch error:',e);}
+}
+
 // ── 15-min Intraday Candles ────────────────────────────────────────────────
 async function fetchCandles(token){
   try{
@@ -714,7 +774,10 @@ async function runScan(auto=false){
   if(scanning)return;
   if(!session){setStg(1,'active');const ok=await login();if(!ok){toast('Connect Angel One in Settings',true);showSec('settings');return;}setStg(1,'done');}
   scanning=true;bullRows=[];bearRows=[];allRows=[];stopFlag=false;
-  await reqWL();setScanUI(true);setStg(2,'active');
+  await reqWL();setScanUI(true);setStg(1,'active');
+  $('progHd').textContent='Fetching OI data…';
+  await fetchOIData(); // Fetch OI buildup data first
+  setStg(1,'done');setStg(2,'active');
   $('progHd').textContent='Fetching live quotes…';
 
   for(let i=0;i<UNI.length;i+=50){
@@ -743,9 +806,14 @@ async function runScan(auto=false){
         rm=q.ltp-q.close;e9=q.ltp;e21=q.close;va=q.vol||1;
       }
 
+      // Get OI from dedicated OI Buildup API cache (more accurate than equity quote)
+      const oiData = oiCache[s.sym] || {};
+      const finalOiChgPct = oiData.oiChgPct || q.oiChgPct || 0;
+
       const row={sym:s.sym,sector:s.sector,ltp:q.ltp,chg:q.pct,vol:q.vol,volAvg:va,
-        rsi:rv,macd:rm,ema9:e9,ema21:e21,oi:q.oi,
-        oiChgPct:q.oiChgPct||0,
+        rsi:rv,macd:rm,ema9:e9,ema21:e21,
+        oi: oiData.oi || q.oi || 0,
+        oiChgPct: finalOiChgPct,
         bScore:0,beScore:0};
       row.bScore=bullScore(row);row.beScore=bearScore(row);
       allRows.push(row);
