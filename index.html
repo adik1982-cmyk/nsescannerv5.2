@@ -11,7 +11,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
   <link rel="manifest" href="./manifest.json"/>
   <link rel="apple-touch-icon" href="./icons/icon-192.png"/>
-  <title>NSE Intraday Screener v5.1</title>
+  <title>NSE Intraday Screener v5.2</title>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
     :root{
@@ -224,7 +224,7 @@
         <div class="brand-dot" id="brandDot"></div>
         <div>
           <div class="brand-name">NSE SCREENER PRO</div>
-          <div class="brand-sub">INTRADAY · OPTIONS · v5.1</div>
+          <div class="brand-sub">INTRADAY · OPTIONS · v5.2</div>
         </div>
       </div>
       <div class="hdr-right">
@@ -622,22 +622,43 @@ async function fetchQuotes(tokens){
     const m={};
     if(d?.data?.fetched)d.data.fetched.forEach(q=>{
       const tok=q.symbolToken||q.symboltoken||q.token||'';
-      if(tok)m[tok]={
-        ltp:parseFloat(q.ltp||0),
-        close:parseFloat(q.close||q.ltp||0),
-        open:parseFloat(q.open||0),high:parseFloat(q.high||0),low:parseFloat(q.low||0),
-        vol:parseInt(q.tradeVolume||q.tradedVolume||0),
-        oi:parseInt(q.opnInterest||0),
-        // OI Change % — try multiple Angel One field names
-        oiChgPct:(()=>{
-          const raw=parseFloat(q.opnInterestChange||q.oiChange||q.changeInOI||0);
-          if(raw!==0) return raw;
-          const oi=parseInt(q.opnInterest||0);
-          const oiPrev=parseInt(q.opnInterestPrev||q.prevOpnInterest||0);
-          if(oi>0&&oiPrev>0) return((oi-oiPrev)/oiPrev)*100;
-          return 0;
-        })(),
-        pct:parseFloat(q.percentChange||0),
+      if(!tok)return;
+
+      // Log ALL fields on first quote to diagnose OI field name
+      if(!window._qLogged){
+        window._qLogged=true;
+        console.log('Angel One quote fields:', JSON.stringify(q));
+        // Show OI fields in toast for debugging
+        const oiFields=Object.keys(q).filter(k=>k.toLowerCase().includes('oi')||k.toLowerCase().includes('interest'));
+        console.log('OI-related fields:', oiFields, oiFields.map(f=>q[f]));
+      }
+
+      // Try EVERY possible OI change field Angel One might return
+      const oi    = parseInt(q.opnInterest||q.openInterest||q.oi||0);
+      const oiChg = parseFloat(
+        q.opnInterestChange   || // most common
+        q.oiChange            ||
+        q.changeInOI          ||
+        q.openInterestChange  ||
+        q.netOIChange         ||
+        q.oiNetChange         ||
+        q.changeinOpenInterest|| 0
+      );
+      // If direct OI change not available, compute from today vs prev OI
+      const oiPrev = parseInt(q.opnInterestPrev||q.prevOpnInterest||q.previousOpenInterest||0);
+      const oiChgPct = oiChg !== 0 ? oiChg :
+                       (oi>0&&oiPrev>0) ? ((oi-oiPrev)/oiPrev)*100 : 0;
+
+      m[tok]={
+        ltp:   parseFloat(q.ltp||0),
+        close: parseFloat(q.close||q.ltp||0),
+        open:  parseFloat(q.open||0),
+        high:  parseFloat(q.high||0),
+        low:   parseFloat(q.low||0),
+        vol:   parseInt(q.tradeVolume||q.tradedVolume||0),
+        oi,
+        oiChgPct,
+        pct:   parseFloat(q.percentChange||q.netChange||0),
       };
     });
     return m;
@@ -819,7 +840,16 @@ function sortBy(col){
 // ── Mode / Sector / TF ─────────────────────────────────────────────────────
 function setMode(m){mode=m;$('btnBull').className='mode-btn '+(m==='bull'?'mb-bull':'mb-bull-off');$('btnBear').className='mode-btn '+(m==='bear'?'mb-bear':'mb-bear-off');renderList();}
 function setSec(el){sector=el.dataset.s;document.querySelectorAll('.sec-pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');renderList();}
-function setTF(el){tf=el.dataset.tf;document.querySelectorAll('.tf-pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');toast(`TF: ${tf==='FIVE_MINUTE'?'5M':tf==='FIFTEEN_MINUTE'?'15M':'1H'}`);}
+function setTF(el){
+  tf=el.dataset.tf;
+  document.querySelectorAll('.tf-pill').forEach(p=>p.classList.remove('active'));
+  el.classList.add('active');
+  const label=tf==='FIVE_MINUTE'?'5M':tf==='FIFTEEN_MINUTE'?'15M':'1H';
+  toast(`TF changed to ${label} — rescanning…`);
+  // Auto rescan on TF change
+  if(session) runScan(false);
+  else toast(`TF: ${label} — Connect Angel One to scan`,false);
+}
 
 // ── FIX 2: TradingView — correct buttons ───────────────────────────────────
 function openTV(sym){
