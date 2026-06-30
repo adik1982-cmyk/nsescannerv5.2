@@ -11,7 +11,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
   <link rel="manifest" href="./manifest.json"/>
   <link rel="apple-touch-icon" href="./icons/icon-192.png"/>
-  <title>NSE Intraday Screener v5.3</title>
+  <title>NSE Intraday Screener v5.4</title>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
     :root{
@@ -224,7 +224,7 @@
         <div class="brand-dot" id="brandDot"></div>
         <div>
           <div class="brand-name">NSE SCREENER PRO</div>
-          <div class="brand-sub">INTRADAY · OPTIONS · v5.3</div>
+          <div class="brand-sub">INTRADAY · OPTIONS · v5.4</div>
         </div>
       </div>
       <div class="hdr-right">
@@ -261,6 +261,15 @@
           <div class="tf-pill active" data-tf="FIFTEEN_MINUTE" onclick="setTF(this)">15M</div>
           <div class="tf-pill" data-tf="ONE_HOUR" onclick="setTF(this)">1H</div>
         </div>
+      </div>
+
+      <!-- Confluence toggle -->
+      <div class="tf-bar" style="border-bottom:1px solid var(--bdr);">
+        <div>
+          <span class="tf-lbl">Multi-TF Confluence</span>
+          <div style="font-size:9px;color:var(--mute);margin-top:2px;">5M+15M+1H must agree — fewer, higher quality signals</div>
+        </div>
+        <button class="toggle" id="confluenceTgl" onclick="toggleConfluence()" style="flex-shrink:0;"></button>
       </div>
 
       <!-- Mode toggle -->
@@ -553,6 +562,7 @@ let countdown=600,cdMax=600;
 let prevBull=new Set(),prevBear=new Set();
 let wakeLock=null,deferredInstall=null;
 let sortCol=null,sortDir='desc';
+let confluenceOn=false;
 let T={rsi:55,rsiB:45,vol:1.2,score:40};
 
 // ── NSE Universe ───────────────────────────────────────────────────────────
@@ -726,14 +736,58 @@ async function fetchOIData(){
 }
 
 // ── 15-min Intraday Candles ────────────────────────────────────────────────
-async function fetchCandles(token){
+async function fetchCandles(token, intervalOverride){
   try{
-    const now=new Date(),from=new Date(now);from.setHours(9,0,0,0);
+    const interval = intervalOverride || tf;
+    const now=new Date(),from=new Date(now);
+    // For 1H need more lookback days to get enough candles
+    if(interval==='ONE_HOUR') from.setDate(from.getDate()-5);
+    from.setHours(9,0,0,0);
     const fmt=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
-    const r=await fetch(`${AB}/rest/secure/angelbroking/historical/v1/getCandleData`,{method:'POST',headers:mkHdr(session.apiKey,session.jwt),body:JSON.stringify({exchange:'NSE',symboltoken:token,interval:tf,fromdate:fmt(from),todate:fmt(now)})});
+    const r=await fetch(`${AB}/rest/secure/angelbroking/historical/v1/getCandleData`,{method:'POST',headers:mkHdr(session.apiKey,session.jwt),body:JSON.stringify({exchange:'NSE',symboltoken:token,interval,fromdate:fmt(from),todate:fmt(now)})});
     const d=await r.json();
     return(d?.data&&d.data.length>=3)?d.data:null;
   }catch{return null;}
+}
+
+// ── Multi-Timeframe Confluence ─────────────────────────────────────────────
+// Computes RSI/MACD/EMA on 3 timeframes and checks if they all agree
+async function computeConfluence(token, sym){
+  const TFS = ['FIVE_MINUTE','FIFTEEN_MINUTE','ONE_HOUR'];
+  const results = {};
+
+  for(const ivl of TFS){
+    const candles = await fetchCandles(token, ivl);
+    if(candles && candles.length >= 5){
+      const cl = candles.map(c=>parseFloat(c[4]));
+      const r = rsi(cl, Math.min(14, cl.length-1));
+      const m = macdVal(cl);
+      const e9 = ema(cl, Math.min(9, cl.length));
+      const e21 = ema(cl, Math.min(21, cl.length));
+      results[ivl] = {
+        rsi: r, macd: m, ema9: e9, ema21: e21,
+        bullish: r>55 && m>0 && e9>e21,
+        bearish: r<45 && m<0 && e9<e21,
+      };
+    } else {
+      results[ivl] = null;
+    }
+    await sleep(40); // small delay between candle calls
+  }
+  return results;
+}
+
+// Confluence score: how many of the 3 timeframes agree
+function confluenceScore(confluence, bullDirection){
+  let agree=0, total=0;
+  for(const ivl of ['FIVE_MINUTE','FIFTEEN_MINUTE','ONE_HOUR']){
+    const r = confluence[ivl];
+    if(!r) continue;
+    total++;
+    if(bullDirection && r.bullish) agree++;
+    if(!bullDirection && r.bearish) agree++;
+  }
+  return { agree, total, allAgree: total>=2 && agree===total };
 }
 
 // ── Indicators ─────────────────────────────────────────────────────────────
@@ -785,7 +839,7 @@ async function runScan(auto=false){
     const batch=UNI.slice(i,i+50);
     const quotes=await fetchQuotes(batch.map(s=>s.token));
     setStg(2,'done');setStg(3,'active');
-    $('progHd').textContent='Fetching 15-min candles…';
+    $('progHd').textContent=confluenceOn?'Fetching candles + confluence check…':'Fetching candles…';
 
     for(const s of batch){
       if(stopFlag)break;
@@ -814,8 +868,31 @@ async function runScan(auto=false){
         rsi:rv,macd:rm,ema9:e9,ema21:e21,
         oi: oiData.oi || q.oi || 0,
         oiChgPct: finalOiChgPct,
-        bScore:0,beScore:0};
+        bScore:0,beScore:0,confluence:null,confluenceTag:''};
       row.bScore=bullScore(row);row.beScore=bearScore(row);
+
+      // Only run expensive 3-TF confluence check for stocks that already
+      // pass the base threshold — keeps scan time reasonable
+      const passesBase = row.bScore>=T.score || row.beScore>=T.score;
+      if(confluenceOn && passesBase && !stopFlag){
+        const conf = await computeConfluence(s.token, s.sym);
+        row.confluence = conf;
+        if(row.bScore>=T.score){
+          const cs = confluenceScore(conf, true);
+          row.confluenceAgree = cs.agree; row.confluenceTotal = cs.total;
+          if(cs.allAgree){ row.bScore = Math.min(row.bScore + 15, 100); row.confluenceTag='ALL-TF ✓'; }
+          else if(cs.agree>0){ row.confluenceTag=`${cs.agree}/${cs.total} TF`; row.bScore = Math.max(row.bScore - 10, 0); }
+          else { row.bScore = Math.max(row.bScore - 25, 0); row.confluenceTag='NO CONFIRM'; }
+        }
+        if(row.beScore>=T.score){
+          const cs = confluenceScore(conf, false);
+          row.confluenceAgree = cs.agree; row.confluenceTotal = cs.total;
+          if(cs.allAgree){ row.beScore = Math.min(row.beScore + 15, 100); row.confluenceTag='ALL-TF ✓'; }
+          else if(cs.agree>0){ row.confluenceTag=`${cs.agree}/${cs.total} TF`; row.beScore = Math.max(row.beScore - 10, 0); }
+          else { row.beScore = Math.max(row.beScore - 25, 0); row.confluenceTag='NO CONFIRM'; }
+        }
+      }
+
       allRows.push(row);
       if(row.bScore>=T.score)bullRows.push({...row,score:row.bScore,bull:true});
       if(row.beScore>=T.score)bearRows.push({...row,score:row.beScore,bull:false});
@@ -863,10 +940,13 @@ function renderList(){
     const rc=r.rsi>=60?'cg':r.rsi>=50?'ca':'cr';
     const mc=r.macd>0?'cg':'cr';
     const oc=r.oiChgPct>3?'cg':r.oiChgPct>0?'ca':r.oiChgPct<0?'cr':'cm';
+    const confBadge = r.confluenceTag
+      ? `<span style="font-size:8px;padding:1px 5px;border-radius:2px;font-weight:700;letter-spacing:.04em;margin-left:4px;background:${r.confluenceTag==='ALL-TF ✓'?'#001a08':r.confluenceTag==='NO CONFIRM'?'#1a0000':'#1a1000'};color:${r.confluenceTag==='ALL-TF ✓'?'var(--green)':r.confluenceTag==='NO CONFIRM'?'var(--red)':'var(--amber)'};border:1px solid ${r.confluenceTag==='ALL-TF ✓'?'#00ff8833':r.confluenceTag==='NO CONFIRM'?'#ff444433':'#f59e0b33'};">${r.confluenceTag}</span>`
+      : '';
     return `<div class="srow ${si.rc}" onclick="openTV('${r.sym}')" ontouchstart="this.classList.add('touched')" ontouchend="this.classList.remove('touched')">
       <div>
         <div class="sym-name">${r.sym}</div>
-        <div class="sym-meta"><span class="sig-tag ${si.tc}">${si.lbl}</span><span class="sym-sect">${r.sector}</span></div>
+        <div class="sym-meta"><span class="sig-tag ${si.tc}">${si.lbl}</span><span class="sym-sect">${r.sector}</span>${confBadge}</div>
       </div>
       <div class="cell cw">₹${fL(r.ltp)}</div>
       <div class="cell ${cc}">${r.chg>=0?'+':''}${f1(r.chg)}%</div>
@@ -1019,6 +1099,13 @@ function showNotifGuide(){
 }
 
 function toggleNewOnly(){newOnly=!newOnly;$('newOnlyTgl').className='toggle'+(newOnly?' on':'');localStorage.setItem('_newOnly',newOnly?'1':'0');updAutoStatus();}
+
+function toggleConfluence(){
+  confluenceOn=!confluenceOn;
+  $('confluenceTgl').className='toggle'+(confluenceOn?' on':'');
+  localStorage.setItem('_confluenceOn',confluenceOn?'1':'0');
+  toast(confluenceOn?'✅ Confluence ON — slower scan, higher quality':'⚡ Confluence OFF — faster scan');
+}
 
 // ── Auto scan scheduler ────────────────────────────────────────────────────
 function isMarket(){return isMarketHours();}
@@ -1207,9 +1294,11 @@ function init(){
   autoOn=localStorage.getItem('_autoOn')==='1';
   notifOn=localStorage.getItem('_notifOn')==='1';
   newOnly=localStorage.getItem('_newOnly')!=='0';
+  confluenceOn=localStorage.getItem('_confluenceOn')==='1';
   $('autoTgl').className='toggle'+(autoOn?' on':'');
   $('notifTgl').className='toggle'+(notifOn?' on':'');
   $('newOnlyTgl').className='toggle'+(newOnly?' on':'');
+  $('confluenceTgl').className='toggle'+(confluenceOn?' on':'');
   updAutoStatus();
 
   // Auto-connect
