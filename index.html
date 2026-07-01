@@ -11,7 +11,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
   <link rel="manifest" href="./manifest.json"/>
   <link rel="apple-touch-icon" href="./icons/icon-192.png"/>
-  <title>NSE Intraday Screener v5.4</title>
+  <title>NSE Intraday Screener v5.5</title>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
     :root{
@@ -224,7 +224,7 @@
         <div class="brand-dot" id="brandDot"></div>
         <div>
           <div class="brand-name">NSE SCREENER PRO</div>
-          <div class="brand-sub">INTRADAY · OPTIONS · v5.4</div>
+          <div class="brand-sub">INTRADAY · OPTIONS · v5.5</div>
         </div>
       </div>
       <div class="hdr-right">
@@ -791,32 +791,198 @@ function confluenceScore(confluence, bullDirection){
 }
 
 // ── Indicators ─────────────────────────────────────────────────────────────
-function ema(c,p){if(c.length<p)return c[c.length-1]||0;const k=2/(p+1);let e=c.slice(0,p).reduce((a,b)=>a+b,0)/p;for(let i=p;i<c.length;i++)e=c[i]*k+e*(1-k);return e;}
-function rsi(c,p=14){if(c.length<p+1)return 50;let g=0,l=0;for(let i=1;i<=p;i++){const d=c[i]-c[i-1];if(d>0)g+=d;else l-=d;}const ag=g/p,al=l/p;return al===0?100:100-100/(1+ag/al);}
-function macdVal(c){return c.length<12?0:ema(c,Math.min(12,c.length))-ema(c,Math.min(26,c.length));}
+// ── Core Indicators ────────────────────────────────────────────────────────
+function ema(c,p){
+  if(c.length<p)return c[c.length-1]||0;
+  const k=2/(p+1);
+  let e=c.slice(0,p).reduce((a,b)=>a+b,0)/p;
+  for(let i=p;i<c.length;i++)e=c[i]*k+e*(1-k);
+  return e;
+}
+
+function rsi(c,p=14){
+  if(c.length<p+1)return 50;
+  let g=0,l=0;
+  for(let i=1;i<=p;i++){const d=c[i]-c[i-1];if(d>0)g+=d;else l-=d;}
+  const ag=g/p,al=l/p;
+  return al===0?100:100-100/(1+ag/al);
+}
+
+// RSI for previous candle (to detect crossover)
+function rsiPrev(c,p=14){
+  if(c.length<p+2)return 50;
+  return rsi(c.slice(0,-1),p);
+}
+
+function macdLine(c){
+  if(c.length<12)return 0;
+  return ema(c,Math.min(12,c.length))-ema(c,Math.min(26,c.length));
+}
+
+// MACD Signal line (9-period EMA of MACD)
+function macdSignal(c){
+  if(c.length<26)return 0;
+  // Compute MACD for each candle to get MACD history
+  const macdHistory=[];
+  for(let i=12;i<=c.length;i++){
+    macdHistory.push(ema(c.slice(0,i),Math.min(12,i))-ema(c.slice(0,i),Math.min(26,i)));
+  }
+  return ema(macdHistory,Math.min(9,macdHistory.length));
+}
+
+// Previous MACD line (to detect crossover)
+function macdLinePrev(c){
+  if(c.length<13)return 0;
+  return macdLine(c.slice(0,-1));
+}
+function macdSignalPrev(c){
+  if(c.length<27)return 0;
+  return macdSignal(c.slice(0,-1));
+}
+
+// VWAP (Volume Weighted Average Price for today)
+function vwap(candles){
+  if(!candles||!candles.length)return 0;
+  let cumTV=0,cumV=0;
+  for(const c of candles){
+    const h=parseFloat(c[2]),l=parseFloat(c[3]),cl=parseFloat(c[4]),v=parseInt(c[5]);
+    const tp=(h+l+cl)/3;
+    cumTV+=tp*v; cumV+=v;
+  }
+  return cumV>0?cumTV/cumV:0;
+}
+
 function vAvg(v){const s=v.slice(0,-1);return s.length?s.reduce((a,b)=>a+b,0)/s.length:1;}
 
-function bullScore(s){
-  let sc=0;const vr=s.vol/(s.volAvg||1);
-  if(vr>2)sc+=30;else if(vr>1.5)sc+=20;else if(vr>1.2)sc+=10;
-  if(s.rsi>60&&s.rsi<80)sc+=25;else if(s.rsi>=55)sc+=15;else if(s.rsi>=50)sc+=5;
-  if(s.macd>0)sc+=20;
-  if(s.ema9>s.ema21)sc+=15;
-  if(s.ltp>s.ema9)sc+=10;
-  if(s.oiChgPct>3)sc+=10;else if(s.oiChgPct>0)sc+=5;
-  if(s.chg>0.5)sc+=5;else if(s.chg>0)sc+=2;
-  return Math.min(sc,100);
+// Average True Range — measures volatility/momentum strength
+function atr(candles,p=14){
+  if(!candles||candles.length<2)return 0;
+  const trs=[];
+  for(let i=1;i<candles.length;i++){
+    const h=parseFloat(candles[i][2]),l=parseFloat(candles[i][3]),pc=parseFloat(candles[i-1][4]);
+    trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
+  }
+  return trs.slice(-p).reduce((a,b)=>a+b,0)/Math.min(trs.length,p);
 }
+
+// ── EARLY ENTRY SCORING ENGINE ─────────────────────────────────────────────
+// Detects stocks at the START of a move, not after they've already run
+// Uses crossovers (turning points) instead of static value checks
+
+function bullScore(s){
+  let sc=0;
+  const vr = s.vol/(s.volAvg||1);
+
+  // ── 1. VOLUME SURGE — first sign of institutional activity ────────────
+  // Sudden volume spike means smart money is entering RIGHT NOW
+  if(vr>2.5)     sc+=30;   // explosive volume — very early strong signal
+  else if(vr>2.0)sc+=25;
+  else if(vr>1.5)sc+=15;
+  else if(vr>1.2)sc+=8;
+
+  // ── 2. RSI CROSSOVER — momentum just turning bullish ─────────────────
+  // Key insight: RSI crossing 50 from BELOW = trend just turned
+  // RSI already at 65+ = trend already established (late)
+  const rsiCrossAbove50 = s.rsiPrev<50 && s.rsi>=50;   // just crossed up
+  const rsiCrossAbove55 = s.rsiPrev<55 && s.rsi>=55;   // stronger cross
+  if(rsiCrossAbove55)     sc+=28;  // best — fresh momentum signal
+  else if(rsiCrossAbove50)sc+=22;  // good — momentum just turning
+  else if(s.rsi>=50&&s.rsi<60)sc+=10;  // rising but not crossed yet
+  else if(s.rsi>=60&&s.rsi<70)sc+=5;   // already moving — reduced
+  // PENALTY: RSI overbought means stock already ran — late entry risk
+  if(s.rsi>=72) sc-=20;
+  if(s.rsi>=80) sc-=35;
+
+  // ── 3. MACD CROSSOVER — the most reliable early signal ───────────────
+  // MACD line crossing ABOVE signal line = trend change just starting
+  const macdCross = s.macdPrev<=s.macdSigPrev && s.macd>s.macdSig;
+  const macdJustPositive = s.macdPrev<=0 && s.macd>0;
+  if(macdCross&&macdJustPositive) sc+=30;  // double confirmation — very early
+  else if(macdCross)              sc+=25;  // crossover — early signal
+  else if(macdJustPositive)       sc+=20;  // just turned positive
+  else if(s.macd>0&&s.macd>s.macdSig)sc+=8;  // positive but established
+
+  // ── 4. EMA CROSSOVER — Golden Cross ──────────────────────────────────
+  // EMA9 crossing above EMA21 = short-term trend just turned bullish
+  const emaCross = s.ema9Prev<=s.ema21Prev && s.ema9>s.ema21;
+  if(emaCross)                     sc+=22;  // fresh crossover — early
+  else if(s.ema9>s.ema21)          sc+=8;   // already crossed — established
+
+  // ── 5. PRICE vs VWAP — institutional benchmark ───────────────────────
+  // Price crossing above VWAP = institutions net buying
+  const vwapCross = s.ltpPrev&&s.ltpPrev<s.vwapVal && s.ltp>=s.vwapVal;
+  if(vwapCross)               sc+=20;   // just crossed VWAP — early signal
+  else if(s.ltp>s.vwapVal)   sc+=8;    // above VWAP — bullish but established
+
+  // ── 6. OI BUILDUP — confirms fresh positions ─────────────────────────
+  if(s.oiChgPct>8)  sc+=15;
+  else if(s.oiChgPct>3)sc+=8;
+  else if(s.oiChgPct>0)sc+=3;
+
+  // ── 7. PRICE CHANGE — early move is small, late move is large ────────
+  // Stock up 0.3-1.5%: early in the move — good entry
+  // Stock up 3%+: already moved significantly — risky entry
+  if(s.chg>=0.3&&s.chg<=1.5)  sc+=12;  // ideal early move range
+  else if(s.chg>1.5&&s.chg<=2.5)sc+=5;
+  else if(s.chg>2.5&&s.chg<=3.5)sc-=10; // already run — penalty
+  else if(s.chg>3.5)             sc-=20; // significantly extended — avoid
+  else if(s.chg<0)               sc-=5;  // negative on bullish
+
+  return Math.max(0,Math.min(sc,100));
+}
+
 function bearScore(s){
-  let sc=0;const vr=s.vol/(s.volAvg||1);
-  if(vr>2&&s.chg<0)sc+=30;else if(vr>1.5&&s.chg<0)sc+=20;else if(vr>1.2&&s.chg<0)sc+=10;
-  if(s.rsi<40&&s.rsi>20)sc+=25;else if(s.rsi<=45)sc+=15;else if(s.rsi<=50)sc+=5;
-  if(s.macd<0)sc+=20;
-  if(s.ema9<s.ema21)sc+=15;
-  if(s.ltp<s.ema9)sc+=10;
-  if(s.oiChgPct>3&&s.chg<0)sc+=10;else if(s.oiChgPct>0&&s.chg<0)sc+=5;
-  if(s.chg<-0.5)sc+=5;else if(s.chg<0)sc+=2;
-  return Math.min(sc,100);
+  let sc=0;
+  const vr = s.vol/(s.volAvg||1);
+
+  // ── 1. VOLUME SURGE on downside ───────────────────────────────────────
+  if(vr>2.5&&s.chg<0)      sc+=30;
+  else if(vr>2.0&&s.chg<0) sc+=25;
+  else if(vr>1.5&&s.chg<0) sc+=15;
+  else if(vr>1.2&&s.chg<0) sc+=8;
+
+  // ── 2. RSI CROSSOVER downward ─────────────────────────────────────────
+  const rsiCrossBelow50 = s.rsiPrev>50 && s.rsi<=50;
+  const rsiCrossBelow45 = s.rsiPrev>45 && s.rsi<=45;
+  if(rsiCrossBelow45)      sc+=28;
+  else if(rsiCrossBelow50) sc+=22;
+  else if(s.rsi<=50&&s.rsi>40)sc+=10;
+  else if(s.rsi<=40&&s.rsi>30)sc+=5;
+  // PENALTY: RSI oversold — stock already fallen significantly
+  if(s.rsi<=28) sc-=20;
+  if(s.rsi<=20) sc-=35;
+
+  // ── 3. MACD CROSSOVER downward ────────────────────────────────────────
+  const macdCross = s.macdPrev>=s.macdSigPrev && s.macd<s.macdSig;
+  const macdJustNeg = s.macdPrev>=0 && s.macd<0;
+  if(macdCross&&macdJustNeg)  sc+=30;
+  else if(macdCross)          sc+=25;
+  else if(macdJustNeg)        sc+=20;
+  else if(s.macd<0&&s.macd<s.macdSig)sc+=8;
+
+  // ── 4. EMA CROSSOVER — Death Cross ───────────────────────────────────
+  const emaCross = s.ema9Prev>=s.ema21Prev && s.ema9<s.ema21;
+  if(emaCross)               sc+=22;
+  else if(s.ema9<s.ema21)    sc+=8;
+
+  // ── 5. PRICE vs VWAP ─────────────────────────────────────────────────
+  const vwapCross = s.ltpPrev&&s.ltpPrev>s.vwapVal && s.ltp<=s.vwapVal;
+  if(vwapCross)              sc+=20;
+  else if(s.ltp<s.vwapVal)  sc+=8;
+
+  // ── 6. OI BUILDUP on downside ─────────────────────────────────────────
+  if(s.oiChgPct>8&&s.chg<0)   sc+=15;
+  else if(s.oiChgPct>3&&s.chg<0)sc+=8;
+  else if(s.oiChgPct>0&&s.chg<0)sc+=3;
+
+  // ── 7. PRICE CHANGE — ideal bearish move is -0.3% to -1.5% ──────────
+  if(s.chg<=-0.3&&s.chg>=-1.5)  sc+=12;
+  else if(s.chg<-1.5&&s.chg>=-2.5)sc+=5;
+  else if(s.chg<-2.5&&s.chg>=-3.5)sc-=10;
+  else if(s.chg<-3.5)             sc-=20;
+  else if(s.chg>0)                sc-=5;
+
+  return Math.max(0,Math.min(sc,100));
 }
 function sigInfo(sc,bull){
   if(bull){if(sc>=70)return{lbl:'STRONG BUY',tc:'st-sb',rc:'r-sb'};if(sc>=45)return{lbl:'BUY',tc:'st-b',rc:'r-b'};return{lbl:'WATCH',tc:'st-w',rc:''};}
@@ -847,27 +1013,63 @@ async function runScan(auto=false){
       if(!q||!q.ltp||q.ltp===0){updProg(allRows.length+bullRows.length+bearRows.length);continue;}
 
       const candles=await fetchCandles(s.token);
-      let rv=50,rm=0,e9=q.ltp,e21=q.ltp,va=q.vol||1;
-      if(candles&&candles.length>=3){
+      // ── Crossover indicators — need current AND previous values ─────
+      let rv=50,rvPrev=50,rmLine=0,rmSig=0,rmLinePrev=0,rmSigPrev=0;
+      let e9=q.ltp,e21=q.ltp,e9Prev=q.ltp,e21Prev=q.ltp;
+      let va=q.vol||1,vwapVal=q.ltp,ltpPrev=0;
+
+      if(candles&&candles.length>=5){
         const cl=candles.map(c=>parseFloat(c[4]));
         const vl=candles.map(c=>parseInt(c[5]));
-        rv=rsi(cl,Math.min(14,cl.length-1));rm=macdVal(cl);
-        e9=ema(cl,Math.min(9,cl.length));e21=ema(cl,Math.min(21,cl.length));
-        va=vAvg(vl)||q.vol||1;
+
+        // Current values
+        rv     = rsi(cl,Math.min(14,cl.length-1));
+        rmLine = macdLine(cl);
+        rmSig  = macdSignal(cl);
+        e9     = ema(cl,Math.min(9,cl.length));
+        e21    = ema(cl,Math.min(21,cl.length));
+        va     = vAvg(vl)||q.vol||1;
+        vwapVal= vwap(candles);
+        ltpPrev= cl.length>=2?cl[cl.length-2]:cl[cl.length-1];
+
+        // Previous candle values — detect CROSSOVERS
+        if(cl.length>=3){
+          const clPrev=cl.slice(0,-1);
+          rvPrev      = rsi(clPrev,Math.min(14,clPrev.length-1));
+          rmLinePrev  = macdLine(clPrev);
+          rmSigPrev   = macdSignal(clPrev);
+          e9Prev      = ema(clPrev,Math.min(9,clPrev.length));
+          e21Prev     = ema(clPrev,Math.min(21,clPrev.length));
+        }
       }else{
+        // Synthetic from quote when candles unavailable
         const range=(q.high-q.low)||1;
-        rv=q.pct>0?Math.min(55+(q.pct/range*20),80):Math.max(45+(q.pct/range*20),20);
-        rm=q.ltp-q.close;e9=q.ltp;e21=q.close;va=q.vol||1;
+        rv      = q.pct>0?Math.min(52+(q.pct/range*15),75):Math.max(48-(Math.abs(q.pct)/range*15),25);
+        rvPrev  = 50; // neutral — no crossover signal without candles
+        rmLine  = q.ltp-q.close;
+        rmSig   = 0;
+        e9      = q.ltp; e21=q.close;
+        vwapVal = (q.open+q.high+q.low+q.ltp)/4;
+        va      = q.vol||1;
       }
 
       // Get OI from dedicated OI Buildup API cache (more accurate than equity quote)
       const oiData = oiCache[s.sym] || {};
       const finalOiChgPct = oiData.oiChgPct || q.oiChgPct || 0;
 
-      const row={sym:s.sym,sector:s.sector,ltp:q.ltp,chg:q.pct,vol:q.vol,volAvg:va,
-        rsi:rv,macd:rm,ema9:e9,ema21:e21,
-        oi: oiData.oi || q.oi || 0,
-        oiChgPct: finalOiChgPct,
+      const row={
+        sym:s.sym,sector:s.sector,
+        ltp:q.ltp,ltpPrev,
+        chg:q.pct,vol:q.vol,volAvg:va,
+        // Current crossover indicators
+        rsi:rv,     rsiPrev:rvPrev,
+        macd:rmLine,macdSig:rmSig,
+        macdPrev:rmLinePrev, macdSigPrev:rmSigPrev,
+        ema9:e9,    ema9Prev:e9Prev,
+        ema21:e21,  ema21Prev:e21Prev,
+        vwapVal,
+        oi:oiData.oi||q.oi||0,
+        oiChgPct:finalOiChgPct,
         bScore:0,beScore:0,confluence:null,confluenceTag:''};
       row.bScore=bullScore(row);row.beScore=bearScore(row);
 
@@ -940,13 +1142,46 @@ function renderList(){
     const rc=r.rsi>=60?'cg':r.rsi>=50?'ca':'cr';
     const mc=r.macd>0?'cg':'cr';
     const oc=r.oiChgPct>3?'cg':r.oiChgPct>0?'ca':r.oiChgPct<0?'cr':'cm';
+    // Build trigger badges — show WHY this stock was flagged
+    const triggers=[];
+    if(r.bull){
+      const rsiCross=r.rsiPrev<55&&r.rsi>=55;
+      const macdCross=r.macdPrev<=r.macdSigPrev&&r.macd>r.macdSig;
+      const emaCross=r.ema9Prev<=r.ema21Prev&&r.ema9>r.ema21;
+      const vwapCross=r.ltpPrev&&r.ltpPrev<r.vwapVal&&r.ltp>=r.vwapVal;
+      const volSpike=r.vol/(r.volAvg||1)>2;
+      if(rsiCross)  triggers.push({lbl:'RSI↑',c:'#00ff88'});
+      if(macdCross) triggers.push({lbl:'MACD✕',c:'#00ff88'});
+      if(emaCross)  triggers.push({lbl:'EMA✕',c:'#22d3ee'});
+      if(vwapCross) triggers.push({lbl:'VWAP↑',c:'#a78bfa'});
+      if(volSpike)  triggers.push({lbl:'VOL⚡',c:'#f59e0b'});
+    }else{
+      const rsiCross=r.rsiPrev>45&&r.rsi<=45;
+      const macdCross=r.macdPrev>=r.macdSigPrev&&r.macd<r.macdSig;
+      const emaCross=r.ema9Prev>=r.ema21Prev&&r.ema9<r.ema21;
+      const vwapCross=r.ltpPrev&&r.ltpPrev>r.vwapVal&&r.ltp<=r.vwapVal;
+      const volSpike=r.vol/(r.volAvg||1)>2&&r.chg<0;
+      if(rsiCross)  triggers.push({lbl:'RSI↓',c:'#ff4444'});
+      if(macdCross) triggers.push({lbl:'MACD✕',c:'#ff4444'});
+      if(emaCross)  triggers.push({lbl:'EMA✕',c:'#f97316'});
+      if(vwapCross) triggers.push({lbl:'VWAP↓',c:'#a78bfa'});
+      if(volSpike)  triggers.push({lbl:'VOL⚡',c:'#f59e0b'});
+    }
+    const triggerBadges=triggers.map(t=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;font-weight:700;background:#111827;color:${t.c};border:1px solid ${t.c}44;">${t.lbl}</span>`).join('');
+
     const confBadge = r.confluenceTag
-      ? `<span style="font-size:8px;padding:1px 5px;border-radius:2px;font-weight:700;letter-spacing:.04em;margin-left:4px;background:${r.confluenceTag==='ALL-TF ✓'?'#001a08':r.confluenceTag==='NO CONFIRM'?'#1a0000':'#1a1000'};color:${r.confluenceTag==='ALL-TF ✓'?'var(--green)':r.confluenceTag==='NO CONFIRM'?'var(--red)':'var(--amber)'};border:1px solid ${r.confluenceTag==='ALL-TF ✓'?'#00ff8833':r.confluenceTag==='NO CONFIRM'?'#ff444433':'#f59e0b33'};">${r.confluenceTag}</span>`
+      ? `<span style="font-size:8px;padding:1px 5px;border-radius:2px;font-weight:700;margin-left:2px;background:${r.confluenceTag==='ALL-TF ✓'?'#001a08':r.confluenceTag==='NO CONFIRM'?'#1a0000':'#1a1000'};color:${r.confluenceTag==='ALL-TF ✓'?'var(--green)':r.confluenceTag==='NO CONFIRM'?'var(--red)':'var(--amber)'};border:1px solid ${r.confluenceTag==='ALL-TF ✓'?'#00ff8833':r.confluenceTag==='NO CONFIRM'?'#ff444433':'#f59e0b33'};">${r.confluenceTag}</span>`
       : '';
+
     return `<div class="srow ${si.rc}" onclick="openTV('${r.sym}')" ontouchstart="this.classList.add('touched')" ontouchend="this.classList.remove('touched')">
       <div>
         <div class="sym-name">${r.sym}</div>
-        <div class="sym-meta"><span class="sig-tag ${si.tc}">${si.lbl}</span><span class="sym-sect">${r.sector}</span>${confBadge}</div>
+        <div class="sym-meta" style="flex-wrap:wrap;gap:3px;">
+          <span class="sig-tag ${si.tc}">${si.lbl}</span>
+          <span class="sym-sect">${r.sector}</span>
+          ${triggerBadges}
+          ${confBadge}
+        </div>
       </div>
       <div class="cell cw">₹${fL(r.ltp)}</div>
       <div class="cell ${cc}">${r.chg>=0?'+':''}${f1(r.chg)}%</div>
